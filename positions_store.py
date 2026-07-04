@@ -38,10 +38,15 @@ store = load()
 
 
 def find_by_clordid_prefix(clordid: str):
-    """ClOrdID luôn có dạng '<msg_id>-ENTRY' / '-SL' / '-TP' / '-CLOSE'."""
+    """ClOrdID luôn bắt đầu bằng '<msg_id>-<TAG>' vd '94-ENTRY', '94-SL', '94-TP',
+    và có thể có hậu tố dài hơn cho lệnh hủy vd '94-ENTRY-CXL-1783178694628-1'.
+    PHẢI tách từ bên TRÁI (lấy phần tử đầu tiên) chứ không rsplit từ bên phải,
+    nếu không các ClOrdID có hậu tố -CXL-... sẽ không parse được msg_id (bug cũ)."""
+    parts = clordid.split("-", 1)
+    if len(parts) < 2:
+        return None, None
     try:
-        msg_id_str, tag = clordid.rsplit("-", 1)
-        msg_id = int(msg_id_str)
+        msg_id = int(parts[0])
     except ValueError:
         return None, None
     return store.get(msg_id), msg_id

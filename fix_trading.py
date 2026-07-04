@@ -164,9 +164,15 @@ class TradingEngine:
             )
             return
 
-        pos["status"] = "CANCELLED"
-        store.save(store.store)
-        self.notify(f"🚫 <b>ĐÃ HỦY LỆNH CHỜ</b>\n🪙 XAUUSD {pos['side']} @ {pos['entry']}\n📋 Chưa khớp, hủy theo yêu cầu admin")
+        # KHÔNG đánh dấu CANCELLED ngay ở đây - phải đợi broker xác nhận thật (ExecType=4)
+        # trong on_execution_report. Lý do: nếu đúng lúc gửi hủy thì lệnh lại vừa khớp
+        # (race condition), đánh dấu CANCELLED ngay sẽ khiến bot bỏ sót 1 vị thế đang mở
+        # thật trên sàn mà không có SL/TP bảo vệ. Để trạng thái PENDING cho tới khi có
+        # xác nhận rõ ràng (Cancelled hoặc Trade) từ broker.
+        self.notify(
+            f"⏳ <b>ĐÃ GỬI YÊU CẦU HỦY</b>\n🪙 XAUUSD {pos['side']} @ {pos['entry']}\n"
+            f"📋 Đang chờ broker xác nhận..."
+        )
 
     # ------------------------------------------------------------------
     # ĐÓNG VỊ THẾ ĐANG MỞ (đã khớp) + hủy SL/TP đang treo
@@ -282,8 +288,15 @@ class TradingEngine:
                 )
             return
 
-        if exec_type == "4":  # Cancelled ack từ broker
-            logger.info(f"[{msg_id}] Lệnh {tag} đã được broker xác nhận hủy")
+        if exec_type == "4":  # Cancelled - broker XÁC NHẬN THẬT lệnh đã hủy
+            if tag == "ENTRY" and pos["status"] == "PENDING":
+                logger.info(f"[{msg_id}] Broker xác nhận đã hủy lệnh ENTRY")
+                pos["status"] = "CANCELLED"
+                store.save(store.store)
+                self.notify(f"🚫 <b>ĐÃ HỦY LỆNH CHỜ</b>\n🪙 XAUUSD {pos['side']} @ {pos['entry']}\n📋 Broker đã xác nhận hủy")
+            else:
+                logger.info(f"[{msg_id}] Lệnh {tag} đã được broker xác nhận hủy")
+            return
 
     # ------------------------------------------------------------------
     # XỬ LÝ BUSINESS MESSAGE REJECT (35=j) - đặc biệt ORDER_NOT_FOUND khi hủy lệnh
@@ -298,12 +311,19 @@ class TradingEngine:
         ref_id = fields.get("379", "")
         if "ORDER_NOT_FOUND" not in reason_text:
             return
-        try:
-            msg_id = int(ref_id.split("-", 1)[0])
-        except (ValueError, IndexError):
+        parts = ref_id.split("-", 2)
+        if len(parts) < 2:
             return
+        try:
+            msg_id = int(parts[0])
+        except ValueError:
+            return
+        tag = parts[1]
         pos = store.store.get(msg_id)
-        if not pos or pos["status"] not in ("PENDING", "OPEN"):
+        # CHỈ xử lý khi đang PENDING và liên quan tới ENTRY - KHÔNG BAO GIỜ tự động hạ
+        # trạng thái OPEN xuống CANCELLED chỉ vì 1 cancel request cũ/lạc bị ORDER_NOT_FOUND,
+        # vì vị thế OPEN có thể đang có SL/TP sống thật, đánh rớt theo dõi sẽ rất nguy hiểm.
+        if not pos or pos["status"] != "PENDING" or tag != "ENTRY":
             return
         logger.warning(
             f"[{msg_id}] Lệnh không tồn tại trên broker (đã bị hủy/khớp/đóng thủ công "
