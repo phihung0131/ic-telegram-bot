@@ -1,0 +1,6 @@
+__pycache__ 
+venv 
+.env
+logs
+session_ct_bot.*
+open_positions.json
