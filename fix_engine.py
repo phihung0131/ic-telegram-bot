@@ -60,7 +60,7 @@ class FixMessage:
 class FixSession:
     def __init__(self, name, host, port, sender_comp_id, target_comp_id, sender_sub_id,
                  password, account, use_ssl=True, heartbeat_interval=30, on_message=None,
-                 on_logon=None, on_disconnect=None, target_sub_id=None, reconnect_delay_sec=10):
+                 on_logon=None, on_disconnect=None, target_sub_id=None, reconnect_delay_sec=30):
         self.name = name
         self.host = host
         self.port = port

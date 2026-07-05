@@ -33,6 +33,7 @@ CT_PASSWORD = os.getenv(f"CT_PASSWORD{_SUF}")
 CT_ACCOUNT = os.getenv(f"CT_ACCOUNT{_SUF}")
 CT_USE_SSL = os.getenv("CT_USE_SSL", "True").lower() == "true"
 CT_HEARTBEAT_SEC = int(os.getenv("CT_HEARTBEAT_SEC", 30))
+CT_RECONNECT_DELAY_SEC = int(os.getenv("CT_RECONNECT_DELAY_SEC", 5))
 
 CT_SYMBOL = os.getenv("CT_SYMBOL", "XAUUSD")
 CT_SYMBOL_ID = os.getenv("CT_SYMBOL_ID") or None
@@ -118,6 +119,7 @@ quote_session = FixSession(
     sender_comp_id=CT_SENDER_COMPID, target_comp_id=CT_TARGET_COMPID, sender_sub_id="QUOTE",
     password=CT_PASSWORD, account=CT_ACCOUNT, use_ssl=CT_USE_SSL,
     heartbeat_interval=CT_HEARTBEAT_SEC, on_logon=on_logon, on_disconnect=on_disconnect,
+    reconnect_delay_sec=CT_RECONNECT_DELAY_SEC,
 )
 
 trade_session = FixSession(
@@ -126,6 +128,7 @@ trade_session = FixSession(
     password=CT_PASSWORD, account=CT_ACCOUNT, use_ssl=CT_USE_SSL,
     heartbeat_interval=CT_HEARTBEAT_SEC, on_message=on_trade_message,
     on_logon=on_logon, on_disconnect=on_disconnect,
+    reconnect_delay_sec=CT_RECONNECT_DELAY_SEC,
 )
 
 trading_engine = TradingEngine(
