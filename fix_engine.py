@@ -60,7 +60,7 @@ class FixMessage:
 class FixSession:
     def __init__(self, name, host, port, sender_comp_id, target_comp_id, sender_sub_id,
                  password, account, use_ssl=True, heartbeat_interval=30, on_message=None,
-                 on_logon=None, on_disconnect=None, target_sub_id=None):
+                 on_logon=None, on_disconnect=None, target_sub_id=None, reconnect_delay_sec=10):
         self.name = name
         self.host = host
         self.port = port
@@ -76,6 +76,9 @@ class FixSession:
         self.on_message = on_message
         self.on_logon = on_logon
         self.on_disconnect = on_disconnect
+        # Số giây chờ giữa các lần tự động kết nối lại khi mất kết nối ngoài ý muốn
+        # (không áp dụng khi tự chủ động gọi close(), vd lúc bot tắt bình thường)
+        self.reconnect_delay_sec = reconnect_delay_sec
 
         self.sock = None
         self.seq_num = 1
@@ -83,9 +86,21 @@ class FixSession:
         self.logged_on = False
         self._recv_buf = ""
         self._lock = threading.Lock()
+        self._intentional_close = False  # True khi close() được gọi chủ động -> không tự reconnect
 
     # ---------------------------------------------------------------
     def connect(self):
+        # Dọn socket cũ (nếu có, vd từ lần reconnect trước) tránh rò rỉ file descriptor
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self._intentional_close = False
+        self._recv_buf = ""
+        self.seq_num = 1  # server luôn nhận ResetSeqNumFlag=Y ở Logon nên reset về 1 là an toàn
+        self.logged_on = False
+
         raw_sock = socket.create_connection((self.host, self.port), timeout=15)
         if self.use_ssl:
             ctx = ssl.create_default_context()
@@ -158,6 +173,24 @@ class FixSession:
             except Exception:
                 logger.exception(f"[{self.name}] Lỗi trong on_disconnect callback")
 
+        if not self._intentional_close:
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        """Retry vô hạn, cách nhau reconnect_delay_sec giây, cho tới khi connect() thành công.
+        Chạy trong thread riêng để không chặn/không cần recv loop cũ."""
+        def _attempt():
+            time.sleep(self.reconnect_delay_sec)
+            logger.info(f"[{self.name}] Đang thử kết nối lại sau {self.reconnect_delay_sec}s...")
+            try:
+                self.connect()
+                logger.info(f"[{self.name}] Kết nối lại thành công (đang chờ Logon ack)")
+            except Exception:
+                logger.exception(f"[{self.name}] Kết nối lại thất bại, sẽ thử tiếp")
+                self._schedule_reconnect()
+
+        threading.Thread(target=_attempt, daemon=True, name=f"fix-reconnect-{self.name}").start()
+
     def _drain_buffer(self):
         while True:
             start = self._recv_buf.find("8=FIX")
@@ -208,6 +241,7 @@ class FixSession:
                 logger.exception(f"[{self.name}] Lỗi trong on_message callback")
 
     def close(self):
+        self._intentional_close = True
         self.running = False
         try:
             self._send(FixMessage(), "5")
