@@ -196,12 +196,14 @@ class TradingEngine:
             cxl.append(11, f"{msg_id}-{tag}-CXL-{_next_clordid_suffix()}")
             if order_id:
                 cxl.append(37, order_id)
-            if pos.get("position_id"):
-                cxl.append(721, pos["position_id"])  # PositionID - cần để broker xác định đúng lệnh trên tài khoản Hedging
-            # Chỉ giữ OrigClOrdID/ClOrdID/OrderID(/PositionID) - broker reject mọi field khác trên Cancel
+            # CHỈ giữ OrigClOrdID/ClOrdID/OrderID trên Cancel - broker (IC Markets/cTrader)
+            # REJECT thẳng nếu có tag 721 (PositionID) ở đây, dù nó bắt buộc trên
+            # NewOrderSingle. Đã xác nhận qua Session Reject thực tế: "Tag not defined
+            # for this message type, field=721" (RefMsgType=F). PositionID chỉ hợp lệ
+            # khi TẠO lệnh (msg type D), không hợp lệ khi HỦY lệnh (msg type F).
             try:
                 self.trade.send_app_message(cxl, "F")
-                logger.info(f"[{msg_id}] Đã gửi hủy {tag} trước khi đóng vị thế (OrderID={order_id}, PositionID={pos.get('position_id')})")
+                logger.info(f"[{msg_id}] Đã gửi hủy {tag} trước khi đóng vị thế (OrderID={order_id})")
             except Exception:
                 logger.exception(f"[{msg_id}] Gửi hủy {tag} thất bại khi đóng vị thế (bỏ qua, vẫn thử đóng vị thế chính)")
 
@@ -240,7 +242,9 @@ class TradingEngine:
         exec_type = fields.get("150")  # ExecType: 0=New,4=Cancelled,8=Rejected,F=Trade...
         ord_status = fields.get("39")
         order_id = fields.get("37")
-        last_px = fields.get("31")
+        # IC Markets/cTrader thường trả giá khớp ở tag 6 (AvgPx) thay vì tag 31 (LastPx
+        # chuẩn FIX) - ưu tiên 31 nếu có, fallback sang 6, để tránh hiện "None" trong log/notify.
+        last_px = fields.get("31") or fields.get("6")
 
         logger.info(
             f"ExecutionReport nhận được: ClOrdID={clordid} ExecType={exec_type} "
@@ -303,12 +307,13 @@ class TradingEngine:
                 cxl.append(11, f"{msg_id}-{other}-CXL-{_next_clordid_suffix()}")
                 if other_order_id:
                     cxl.append(37, other_order_id)
-                if pos.get("position_id"):
-                    cxl.append(721, pos["position_id"])  # PositionID - cần để broker xác định đúng lệnh trên tài khoản Hedging
-                # Chỉ giữ OrigClOrdID/ClOrdID/OrderID(/PositionID) - broker reject mọi field khác trên Cancel
+                # CHỈ giữ OrigClOrdID/ClOrdID/OrderID - broker REJECT thẳng nếu có tag 721
+                # (PositionID) trên Cancel (đã xác nhận qua Session Reject thực tế: "Tag not
+                # defined for this message type, field=721", RefMsgType=F). PositionID chỉ
+                # hợp lệ khi TẠO lệnh (msg type D), không hợp lệ khi HỦY (msg type F).
                 try:
                     self.trade.send_app_message(cxl, "F")
-                    logger.info(f"[{msg_id}] Đã gửi OrderCancelRequest hủy {other} (OrderID={other_order_id}, PositionID={pos.get('position_id')})")
+                    logger.info(f"[{msg_id}] Đã gửi OrderCancelRequest hủy {other} (OrderID={other_order_id})")
                 except Exception:
                     logger.exception(f"[{msg_id}] Gửi hủy {other} (OCO) thất bại sau khi {tag} khớp")
                     self.notify(
