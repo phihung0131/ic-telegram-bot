@@ -44,6 +44,13 @@ TP_OFFSET = float(os.getenv("TP_OFFSET", 10))
 FIXED_VOLUME = float(os.getenv("FIXED_VOLUME", 0.01))
 SETUP_MATCH_TOLERANCE = float(os.getenv("SETUP_MATCH_TOLERANCE", 5))
 
+# ---- TRAILING PROFIT (dời SL/TP theo lời + đóng ngay nếu lời tụt sâu) ----
+# Đơn vị: giá trực tiếp, giống TP_OFFSET (KHÔNG phải pips/tiền thật).
+CT_TRAILING_ENABLED = os.getenv("CT_TRAILING_ENABLED", "True").lower() == "true"
+CT_TRAIL_STEP = float(os.getenv("CT_TRAIL_STEP", 5))
+CT_TRAIL_DRAWDOWN = float(os.getenv("CT_TRAIL_DRAWDOWN", 3))
+CT_TRAIL_CHECK_INTERVAL_SEC = int(os.getenv("CT_TRAIL_CHECK_INTERVAL_SEC", 3))
+
 BOT_START_TIME = datetime.now()
 last_signal_message_at = None
 processed_message_ids = set()
@@ -107,6 +114,10 @@ def on_trade_message(session_name, msg_type, fields):
 
 def on_logon(session_name):
     logger.info(f"Session {session_name} sẵn sàng")
+    if session_name == "QUOTE":
+        # Subscribe giá real-time ngay khi QUOTE session Logon xong (kể cả sau
+        # reconnect) - cần cho trailing profit tính lời nổi liên tục.
+        trading_engine.subscribe_market_data()
 
 
 def on_disconnect(session_name):
@@ -120,6 +131,7 @@ quote_session = FixSession(
     password=CT_PASSWORD, account=CT_ACCOUNT, use_ssl=CT_USE_SSL,
     heartbeat_interval=CT_HEARTBEAT_SEC, on_logon=on_logon, on_disconnect=on_disconnect,
     reconnect_delay_sec=CT_RECONNECT_DELAY_SEC,
+    on_market_data=lambda raw: trading_engine.on_market_data(raw),
 )
 
 trade_session = FixSession(
@@ -134,6 +146,8 @@ trade_session = FixSession(
 trading_engine = TradingEngine(
     quote_session=quote_session, trade_session=trade_session,
     symbol=CT_SYMBOL, symbol_id=CT_SYMBOL_ID, volume=FIXED_VOLUME, notify_fn=send_telegram,
+    trailing_enabled=CT_TRAILING_ENABLED, trail_step=CT_TRAIL_STEP,
+    trail_drawdown=CT_TRAIL_DRAWDOWN, trail_check_interval_sec=CT_TRAIL_CHECK_INTERVAL_SEC,
 )
 
 
@@ -244,12 +258,18 @@ if HEALTHCHECK_CHANNEL_ID:
             return
         uptime = datetime.now() - BOT_START_TIME
         idle = f"{int((datetime.now() - last_signal_message_at).total_seconds() // 60)} phút trước" if last_signal_message_at else "chưa có tin nào"
+        price_info = (
+            f"Bid {trading_engine.latest_bid} / Ask {trading_engine.latest_ask}"
+            if trading_engine.latest_bid is not None else "chưa nhận được giá"
+        )
         await event.reply(
             f"✅ <b>BOT ĐANG SỐNG</b>\n"
             f"🌐 Mode: <b>{'DEMO 🧪' if CT_SANDBOX_MODE else 'REAL 💰'}</b>\n"
             f"⏳ Uptime: {str(uptime).split('.')[0]}\n"
             f"📡 QUOTE: {'connected' if quote_session.logged_on else 'DISCONNECTED ⚠️'} | "
             f"TRADE: {'connected' if trade_session.logged_on else 'DISCONNECTED ⚠️'}\n"
+            f"💹 Giá {CT_SYMBOL}: {price_info}\n"
+            f"📈 Trailing: {'BẬT' if CT_TRAILING_ENABLED else 'TẮT'}\n"
             f"📨 Tin gần nhất: {idle}\n"
             f"📂 Đang theo dõi: {len(store.store)} tín hiệu",
             parse_mode="html",
@@ -262,13 +282,20 @@ async def main():
 
     quote_session.connect()
     trade_session.connect()
-    await asyncio.sleep(3)  # chờ Logon 2 session trước khi nhận tín hiệu
+    await asyncio.sleep(3)  # chờ Logon 2 session trước khi nhận tín hiệu (on_logon sẽ tự subscribe market data)
 
+    trading_engine.start_trailing_monitor()
+
+    trailing_info = (
+        f"📈 Trailing: mỗi +{CT_TRAIL_STEP} lời dời SL/TP, đóng ngay nếu tụt {CT_TRAIL_DRAWDOWN} từ đỉnh"
+        if CT_TRAILING_ENABLED else "📈 Trailing: TẮT"
+    )
     send_telegram(
         f"🤖 <b>BOT XAUUSD KHỞI ĐỘNG</b>\n⏰ <code>{now()}</code>\n"
         f"🌐 Mode: <b>{mode}</b>\n"
         f"📡 QUOTE: {'OK' if quote_session.logged_on else 'LỖI'} | TRADE: {'OK' if trade_session.logged_on else 'LỖI'}\n"
-        f"💵 Volume/lệnh: {FIXED_VOLUME} | TP cố định: entry ± {TP_OFFSET}"
+        f"💵 Volume/lệnh: {FIXED_VOLUME} | TP cố định: entry ± {TP_OFFSET}\n"
+        f"{trailing_info}"
     )
 
     await client.start()

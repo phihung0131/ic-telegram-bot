@@ -25,6 +25,8 @@ VERIFY TRƯỚC KHI DÙNG THẬT:
 """
 
 import itertools
+import math
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -45,13 +47,25 @@ def _transact_time():
 
 
 class TradingEngine:
-    def __init__(self, quote_session, trade_session, symbol, symbol_id, volume, notify_fn):
+    def __init__(self, quote_session, trade_session, symbol, symbol_id, volume, notify_fn,
+                 trailing_enabled=True, trail_step=5.0, trail_drawdown=3.0,
+                 trail_check_interval_sec=3):
         self.quote = quote_session
         self.trade = trade_session
         self.symbol = symbol
         self.symbol_id = symbol_id  # None nếu broker chấp nhận string symbol
         self.volume = volume
         self.notify = notify_fn  # hàm gửi Telegram (chỉ gọi cho sự kiện liên quan giao dịch)
+
+        # ---- Trailing profit (xem docstring _check_trailing_for_position bên dưới) ----
+        self.trailing_enabled = trailing_enabled
+        self.trail_step = trail_step            # mỗi lần lời vượt thêm 1 mốc TRAIL_STEP -> dời SL/TP thêm TRAIL_STEP
+        self.trail_drawdown = trail_drawdown    # tụt bao nhiêu so với ĐỈNH lời đã đạt thì đóng lệnh ngay
+        self.trail_check_interval_sec = trail_check_interval_sec
+        self.latest_bid = None
+        self.latest_ask = None
+        self._md_req_seq = itertools.count(1)
+        self._trailing_thread_started = False
 
     def _tag55(self):
         return self.symbol_id if self.symbol_id else self.symbol
@@ -138,6 +152,8 @@ class TradingEngine:
         self.trade.send_app_message(tp_msg, "D")
 
         pos["status"] = "OPEN"
+        pos.setdefault("trail_level", 0)     # số mốc TRAIL_STEP đã trail rồi (0 = chưa dời lần nào)
+        pos.setdefault("peak_profit", 0.0)   # lời (đơn vị giá) cao nhất từng đạt được, dùng để check tụt/drawdown
         store.save(store.store)
 
     # ------------------------------------------------------------------
@@ -250,6 +266,13 @@ class TradingEngine:
             self.notify(f"❌ <b>LỆNH BỊ TỪ CHỐI</b>\n🪙 XAUUSD {tag}\n💥 {fields.get('58', 'không rõ lý do')}")
             return
 
+        if exec_type == "5":  # Replaced - broker xác nhận đã sửa giá SL/TP (trailing)
+            if order_id:
+                pos["order_ids"][tag] = order_id  # OrderID có thể đổi sau khi Replace, cập nhật lại
+                store.save(store.store)
+            logger.info(f"[{msg_id}] Broker xác nhận đã dời {tag} (trailing) thành công, OrderID mới={order_id}")
+            return
+
         if exec_type == "F":  # Trade - khớp (toàn phần hoặc một phần)
             if tag == "ENTRY":
                 fill_price = last_px or pos["entry"]
@@ -336,3 +359,189 @@ class TradingEngine:
             f"📋 Lệnh không còn tồn tại trên sàn (có thể đã bị thao tác thủ công ngoài bot) "
             f"- bot đã cập nhật lại để tránh nhầm lẫn"
         )
+
+    # ------------------------------------------------------------------
+    # MARKET DATA (giá real-time trên QUOTE session) - cần cho trailing profit
+    # ------------------------------------------------------------------
+    def subscribe_market_data(self):
+        """Gửi MarketDataRequest (35=V) subscribe Bid/Offer cho symbol, gọi 1 lần
+        ngay sau khi QUOTE session Logon xong (xem bot.py::on_logon).
+        VERIFY: cấu trúc group NoRelatedSym / MarketDepth có thể khác nhau tùy
+        broker - nếu bị Reject hoặc không thấy message 35=W trả về, đối chiếu tài
+        liệu FIX API riêng mà IC Markets gửi cho tài khoản của bạn."""
+        if not self.trailing_enabled:
+            return
+        msg = FixMessage()
+        msg.append(262, f"MD-{next(self._md_req_seq)}-{int(time.time())}")  # MDReqID
+        msg.append(263, "1")   # SubscriptionRequestType = Snapshot + Updates
+        msg.append(264, "1")   # MarketDepth = Top of book
+        msg.append(267, "2")   # NoMDEntryTypes
+        msg.append(269, "0")   # MDEntryType = Bid
+        msg.append(269, "1")   # MDEntryType = Offer
+        msg.append(146, "1")   # NoRelatedSym
+        msg.append(55, self._tag55())
+        logger.info(f"Gửi MarketDataRequest subscribe {self.symbol} (phục vụ trailing profit)")
+        try:
+            self.quote.send_app_message(msg, "V")
+        except Exception:
+            logger.exception(
+                "Gửi MarketDataRequest thất bại - trailing sẽ KHÔNG hoạt động cho tới khi subscribe lại "
+                "(vd sau khi QUOTE session reconnect)"
+            )
+
+    def on_market_data(self, raw: str):
+        """Callback gắn vào QUOTE session (on_market_data), nhận message 35=W
+        (Snapshot) hoặc 35=X (Incremental), cập nhật latest_bid/latest_ask.
+        Dùng parse_pairs (giữ tag lặp) vì message MarketData có NHIỀU group entry
+        cùng tag 269 (MDEntryType)/270 (MDEntryPx) - 1 cho Bid, 1 cho Offer."""
+        cur_type = None
+        for tag, value in FixMessage.parse_pairs(raw):
+            if tag == "269":
+                cur_type = value  # "0"=Bid, "1"=Offer, "2"=Trade (bỏ qua loại khác)
+            elif tag == "270" and cur_type in ("0", "1"):
+                try:
+                    price = float(value)
+                except ValueError:
+                    continue
+                if cur_type == "0":
+                    self.latest_bid = price
+                else:
+                    self.latest_ask = price
+
+    # ------------------------------------------------------------------
+    # TRAILING PROFIT: dời SL/TP theo lời + đóng ngay nếu lời tụt sâu từ đỉnh
+    # ------------------------------------------------------------------
+    def _amend_order_price(self, msg_id: int, pos: dict, tag: str, new_price: float) -> bool:
+        """Gửi OrderCancelReplaceRequest (35=G) để SỬA GIÁ lệnh SL/TP đang treo
+        trên broker (không hủy-đặt-lại, mà sửa tại chỗ để giữ nguyên vị trí trong
+        queue nếu broker hỗ trợ). Theo đúng convention đã dùng cho Cancel ở các hàm
+        khác trong file này (cancel_pending_entry/close_open_position), OrigClOrdID
+        luôn dùng ClOrdID GỐC "<msg_id>-<tag>", không dùng chain ClOrdID trung gian.
+
+        VERIFY TRÊN DEMO TRƯỚC KHI BẬT TRAILING Ở REAL: một số broker yêu cầu đầy đủ
+        Symbol(55)/Side(54)/OrderQty(38)/OrdType(40) kèm Price(44)/StopPx(99) trên
+        Replace (khác Cancel thường chỉ cần OrigClOrdID/ClOrdID/OrderID) - đã điền đủ
+        các field phổ biến nhất bên dưới, nhưng nếu bị Business Reject (35=j) thì đối
+        chiếu tài liệu FIX API riêng của broker để biết field nào thiếu/thừa."""
+        order_id = pos["order_ids"].get(tag)
+        close_side = "2" if pos["side"] == "BUY" else "1"
+
+        msg = FixMessage()
+        msg.append(41, f"{msg_id}-{tag}")   # OrigClOrdID (ClOrdID gốc)
+        msg.append(11, f"{msg_id}-{tag}-TRAIL-{_next_clordid_suffix()}")  # ClOrdID mới
+        if order_id:
+            msg.append(37, order_id)        # OrderID hiện tại (nếu đã biết)
+        msg.append(55, self._tag55())
+        msg.append(54, close_side)
+        msg.append(38, self.volume)
+        if tag == "SL":
+            msg.append(40, "3")             # OrdType = Stop
+            msg.append(99, new_price)       # StopPx
+        else:  # TP
+            msg.append(40, "2")             # OrdType = Limit
+            msg.append(44, new_price)       # Price
+        msg.append(59, "1")
+        msg.append(60, _transact_time())
+
+        logger.info(f"[{msg_id}] Trailing: dời {tag} -> {new_price}")
+        try:
+            self.trade.send_app_message(msg, "G")
+            return True
+        except Exception:
+            logger.exception(
+                f"[{msg_id}] Gửi OrderCancelReplaceRequest ({tag}) thất bại - bước trailing này "
+                f"KHÔNG áp dụng được, SL/TP cũ trên broker vẫn còn hiệu lực"
+            )
+            return False
+
+    def _check_trailing_for_position(self, msg_id: int, pos: dict):
+        """
+        Trailing profit (đơn vị: giá trực tiếp, giống quy ước TP_OFFSET của bot):
+          - Lời hiện tại = khoảng cách giá thuận lợi so với entry, dùng giá CÓ THỂ
+            đóng lệnh ngay (BUY: Bid - entry vì đóng BUY = bán tại Bid;
+            SELL: entry - Ask vì đóng SELL = mua tại Ask).
+          - Mỗi khi lời vượt thêm 1 mốc trail_step mới (5, 10, 15, ... theo trailing
+            liên tục) so với mốc đã trail gần nhất -> dời CẢ SL và TP thêm đúng
+            trail_step theo hướng có lợi, khóa dần lợi nhuận.
+          - Theo dõi ĐỈNH lời cao nhất từng đạt (peak_profit). Nếu lời đã từng vượt
+            mốc trail_step đầu tiên rồi sau đó TỤT xuống >= trail_drawdown so với
+            đỉnh đó -> đóng lệnh NGAY bằng market order, không đợi SL/TP đang treo
+            khớp (vì SL vừa dời có thể còn cách khá xa giá hiện tại / có độ trễ).
+        """
+        if pos.get("status") != "OPEN":
+            return
+        side = pos["side"]
+        if side == "BUY":
+            if self.latest_bid is None:
+                return  # chưa nhận được giá nào từ QUOTE session, bỏ qua lượt check này
+            profit = self.latest_bid - pos["entry"]
+        else:
+            if self.latest_ask is None:
+                return
+            profit = pos["entry"] - self.latest_ask
+
+        peak = pos.get("peak_profit", 0.0)
+        if profit > peak:
+            peak = profit
+            pos["peak_profit"] = peak
+            store.save(store.store)
+
+        # --- 1) Trailing liên tục: dời SL/TP thêm 1 (hoặc nhiều) nấc trail_step ---
+        trail_level = pos.get("trail_level", 0)
+        new_level = math.floor(profit / self.trail_step) if profit >= self.trail_step else 0
+        if new_level > trail_level:
+            shift = (new_level - trail_level) * self.trail_step
+            direction = 1 if side == "BUY" else -1
+            new_sl = round(pos["sl"] + direction * shift, 2)
+            new_tp = round(pos["tp"] + direction * shift, 2)
+            ok_sl = self._amend_order_price(msg_id, pos, "SL", new_sl)
+            ok_tp = self._amend_order_price(msg_id, pos, "TP", new_tp)
+            if ok_sl:
+                pos["sl"] = new_sl
+            if ok_tp:
+                pos["tp"] = new_tp
+            pos["trail_level"] = new_level
+            store.save(store.store)
+            self.notify(
+                f"📈 <b>TRAILING - DỜI SL/TP</b>\n🪙 XAUUSD {side}\n"
+                f"💰 Lời hiện tại: <code>{round(profit, 2)}</code> (mốc #{new_level})\n"
+                f"🛑 SL mới: <code>{new_sl}</code>  🎯 TP mới: <code>{new_tp}</code>"
+            )
+
+        # --- 2) Bảo vệ lợi nhuận: lời tụt sâu so với đỉnh đã đạt -> đóng ngay ---
+        if peak >= self.trail_step and (peak - profit) >= self.trail_drawdown:
+            logger.info(
+                f"[{msg_id}] Lời tụt từ đỉnh {round(peak, 2)} xuống {round(profit, 2)} "
+                f"(>= drawdown {self.trail_drawdown}) -> đóng lệnh bảo vệ lợi nhuận"
+            )
+            self.close_open_position(
+                msg_id, pos,
+                reason=f"Trailing: lời tụt từ đỉnh {round(peak, 2)} xuống {round(profit, 2)}, đóng bảo vệ lợi nhuận"
+            )
+
+    def start_trailing_monitor(self):
+        """Khởi động thread nền kiểm tra trailing định kỳ. Gọi 1 lần khi bot khởi
+        động (sau khi tạo TradingEngine), tự bỏ qua nếu trailing bị tắt hoặc đã chạy rồi."""
+        if not self.trailing_enabled or self._trailing_thread_started:
+            return
+        self._trailing_thread_started = True
+        threading.Thread(target=self._trailing_loop, daemon=True, name="trailing-monitor").start()
+        logger.info(
+            f"Trailing profit monitor đã bật: mỗi {self.trail_step} điểm lời dời SL/TP thêm "
+            f"{self.trail_step}, đóng ngay nếu lời tụt {self.trail_drawdown} điểm từ đỉnh "
+            f"(check mỗi {self.trail_check_interval_sec}s)"
+        )
+
+    def _trailing_loop(self):
+        while True:
+            time.sleep(self.trail_check_interval_sec)
+            try:
+                # list(...) để chụp snapshot danh sách msg_id trước, tránh lỗi "dict
+                # changed size during iteration" do thread Telegram có thể thêm lệnh
+                # mới vào store.store cùng lúc.
+                for msg_id in list(store.store.keys()):
+                    pos = store.store.get(msg_id)
+                    if pos and pos.get("status") == "OPEN":
+                        self._check_trailing_for_position(msg_id, pos)
+            except Exception:
+                logger.exception("Lỗi trong vòng lặp trailing monitor (bỏ qua, thử lại ở lần check kế tiếp)")

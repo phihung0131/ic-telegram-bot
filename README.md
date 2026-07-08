@@ -27,6 +27,37 @@ hủy lệnh, đóng lệnh, SL/TP hit, lỗi/reject, mất kết nối FIX, và
 động bot — đúng như yêu cầu, các tin chat linh tinh khác của admin không
 notify.
 
+## Trailing profit (dời SL/TP + đóng bảo vệ lợi nhuận)
+
+Sau khi lệnh đã khớp (OPEN), bot subscribe giá real-time qua QUOTE session
+(`MarketDataRequest`) và cứ mỗi `CT_TRAIL_CHECK_INTERVAL_SEC` giây sẽ tính
+lời nổi (đơn vị giá trực tiếp, giống `TP_OFFSET`) rồi:
+
+1. **Trailing liên tục**: mỗi khi lời vượt thêm 1 mốc `CT_TRAIL_STEP` mới
+   (vd 5, 10, 15, ...) → dời **cả SL và TP** thêm đúng `CT_TRAIL_STEP` theo
+   hướng có lợi (sửa giá lệnh SL/TP đang treo trên broker bằng
+   `OrderCancelReplaceRequest`, 35=G).
+2. **Đóng bảo vệ lợi nhuận**: bot luôn nhớ ĐỈNH lời cao nhất từng đạt. Nếu
+   lời đã từng vượt mốc `CT_TRAIL_STEP` đầu tiên, sau đó tụt xuống
+   `>= CT_TRAIL_DRAWDOWN` so với đỉnh đó → bot đóng lệnh **ngay lập tức**
+   bằng market order (không đợi SL/TP đang treo khớp), để tránh mất hết lời
+   nếu giá đảo chiều nhanh.
+
+Cấu hình trong `.env`: `CT_TRAILING_ENABLED`, `CT_TRAIL_STEP`,
+`CT_TRAIL_DRAWDOWN`, `CT_TRAIL_CHECK_INTERVAL_SEC` (xem `.env.example`).
+
+**BẮT BUỘC TEST KỸ TRÊN DEMO TRƯỚC KHI DÙNG THẬT**, vì phần này chạm tới 2
+điểm rất broker-specific mà mình không kiểm chứng được:
+- `MarketDataRequest` (35=V) và cấu trúc `MarketDataSnapshotFullRefresh`
+  (35=W) trả về (`fix_trading.py::subscribe_market_data`,
+  `on_market_data`) - nếu sau khi Logon QUOTE session mà lệnh `/ic`
+  healthcheck vẫn báo "chưa nhận được giá", nghĩa là request bị
+  reject hoặc sai field, cần đối chiếu tài liệu FIX API riêng của broker.
+- `OrderCancelReplaceRequest` (35=G) để sửa giá SL/TP đang treo
+  (`fix_trading.py::_amend_order_price`) - một số broker yêu cầu field
+  khác/nhiều hơn những gì đã điền. Nếu bị Business Reject, thử đặt lệnh
+  Stop/Limit nhỏ trên demo rồi gửi Replace thử, xem ExecutionReport trả về.
+
 ## BẮT BUỘC PHẢI KIỂM TRA TRƯỚC KHI CHẠY REAL (rất quan trọng)
 
 Phần FIX engine (`fix_engine.py`, `fix_trading.py`) được viết theo quy ước
@@ -42,6 +73,8 @@ bạn đối chiếu và chỉnh sửa các điểm sau **trên môi trường D
 | OrdType Stop có cần thêm field nào khác ngoài tag 99 (StopPx) | `fix_trading.py::_place_bracket_orders` | Đặt thử 1 lệnh Stop nhỏ trên demo, xem ExecutionReport/Reject |
 | Đóng vị thế bằng market order ngược chiều có work đúng không (netting vs hedging) | `fix_trading.py::close_open_position` | Test trên demo: mở BUY rồi thử đóng, kiểm tra account có về đúng flat không |
 | Định dạng giá (mấy chữ số thập phân) | mọi nơi dùng tag 44/99 | XAUUSD trên IC Markets thường 2 chữ số thập phân, nhưng nên in ra để kiểm tra broker có reject vì sai precision không |
+| `MarketDataRequest` (35=V) có trả về 35=W đúng cấu trúc Bid/Offer không | `fix_trading.py::subscribe_market_data` | Dùng `/ic` healthcheck xem có nhận được giá không; nếu không, xem log DEBUG raw message 35=W/reject |
+| `OrderCancelReplaceRequest` (35=G) sửa giá SL/TP có được broker chấp nhận không (dùng cho trailing) | `fix_trading.py::_amend_order_price` | Test trên demo: mở lệnh nhỏ, đợi trailing trigger (hoặc tạm giảm `CT_TRAIL_STEP`), xem ExecutionReport ExecType=5 (Replaced) có về không |
 
 ## Những gì CHƯA có (cân nhắc bổ sung sau khi test ổn):
 - **Reconnect tự động** khi FIX session rớt kết nối (hiện tại chỉ log +
@@ -54,10 +87,11 @@ bạn đối chiếu và chỉnh sửa các điểm sau **trên môi trường D
   connect đều gửi `ResetSeqNumFlag=Y` (tag 141) để đơn giản hóa, một số
   broker yêu cầu duy trì đúng sequence number liên tục thay vì reset mỗi
   lần — nếu server phàn nàn, cần lưu seq_num ra file và bỏ tag 141.
-- Giá lấy khi validate (giống bot crypto so sánh SL/TP với giá thị trường
-  thực trước khi vào lệnh) — QUOTE session hiện mới chỉ Logon, chưa có
-  `MarketDataRequest` để lấy giá real-time. Có thể bổ sung nếu bạn muốn có
-  bước validate tương tự trước khi gửi lệnh.
+- Giá dùng để validate SL/TP trước khi vào lệnh (giống bot crypto so sánh
+  SL/TP với giá thị trường thực trước khi gửi) — QUOTE session giờ ĐÃ có
+  `MarketDataRequest`/giá real-time (phục vụ trailing profit), nên phần
+  validate này giờ dễ bổ sung hơn nếu bạn muốn (dùng `trading_engine.latest_bid`
+  / `latest_ask` có sẵn).
 
 ## Khuyến nghị triển khai
 1. Chạy trên **DEMO** ít nhất 1–2 tuần, theo dõi song song bằng tay để đối

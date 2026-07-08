@@ -56,11 +56,25 @@ class FixMessage:
             out[tag] = value
         return out
 
+    @staticmethod
+    def parse_pairs(raw: str):
+        """Giống parse() nhưng trả về list[(tag, value)] giữ ĐÚNG thứ tự và giữ
+        các tag LẶP LẠI (vd MarketData có nhiều group entry cùng tag 269/270 cho
+        Bid/Offer) - dict thường của parse() sẽ ghi đè mất giá trị bị lặp."""
+        out = []
+        for part in raw.split(SOH):
+            if not part or "=" not in part:
+                continue
+            tag, _, value = part.partition("=")
+            out.append((tag, value))
+        return out
+
 
 class FixSession:
     def __init__(self, name, host, port, sender_comp_id, target_comp_id, sender_sub_id,
                  password, account, use_ssl=True, heartbeat_interval=30, on_message=None,
-                 on_logon=None, on_disconnect=None, target_sub_id=None, reconnect_delay_sec=30):
+                 on_logon=None, on_disconnect=None, target_sub_id=None, reconnect_delay_sec=30,
+                 on_market_data=None):
         self.name = name
         self.host = host
         self.port = port
@@ -76,6 +90,7 @@ class FixSession:
         self.on_message = on_message
         self.on_logon = on_logon
         self.on_disconnect = on_disconnect
+        self.on_market_data = on_market_data  # callback riêng cho 35=W/X (MarketData snapshot/incremental)
         # Số giây chờ giữa các lần tự động kết nối lại khi mất kết nối ngoài ý muốn
         # (không áp dụng khi tự chủ động gọi close(), vd lúc bot tắt bình thường)
         self.reconnect_delay_sec = reconnect_delay_sec
@@ -207,10 +222,21 @@ class FixSession:
             self._recv_buf = self._recv_buf[end + 1:]
             fields = FixMessage.parse(raw_msg)
             logger.debug(f"[{self.name}] << {raw_msg.replace(SOH, '|')}")
-            self._handle_incoming(fields)
+            self._handle_incoming(fields, raw_msg)
 
-    def _handle_incoming(self, fields: dict):
+    def _handle_incoming(self, fields: dict, raw: str = ""):
         msg_type = fields.get("35")
+
+        # MarketDataSnapshotFullRefresh (W) / MarketDataIncrementalRefresh (X):
+        # dispatch riêng qua on_market_data (dùng raw string + parse_pairs) vì
+        # các message này có NHIỀU group entry cùng tag (269/270 lặp cho Bid/Offer),
+        # dict fields ở trên đã bị ghi đè mất giá trị lặp nên không dùng được.
+        if msg_type in ("W", "X") and self.on_market_data:
+            try:
+                self.on_market_data(raw)
+            except Exception:
+                logger.exception(f"[{self.name}] Lỗi trong on_market_data callback")
+            return
 
         if msg_type == "A":  # Logon ack
             self.logged_on = True
